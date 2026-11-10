@@ -23,7 +23,8 @@ k3s(Kubernetes)에 **Apache NiFi 2.11.0**과 **[nifipilot-plus](https://github.c
 | 매니페스트 + 스크립트(build/deploy/verify)를 Docker 안의 실제 k3s(v1.34)에 배포 | 통과 |
 | 그 NiFi에 port-forward로 접속해 쓰기 도구 포함 59단계 live 테스트 | 통과 (59/59) |
 | 사이드카 amd64 이미지 빌드 | 통과 |
-| **AWS VM에서의 배포, `push-image.sh`(scp/ssh) 구간** | **미검증: 이 VM에서 처음 실행하게 됩니다** |
+| 방법 A 전체(`bootstrap-on-vm.sh`: GitHub clone → Docker 빌드 → k3s 임포트 → 배포 → 검증), 재실행, 커밋 SHA 고정, `rollout restart` 후 재검증 | 통과 (Docker 안의 k3s, Docker 빌더) |
+| **AWS VM에서의 실행, Podman 빌더 경로, `push-image.sh`(scp/ssh) 구간** | **미검증: 이 VM에서 처음 실행하게 됩니다** |
 | NiFi 1.x, 클러스터, LDAP/OIDC 로그인, Ingress 노출 | 미검증 |
 
 ## 사전 준비
@@ -34,7 +35,18 @@ k3s(Kubernetes)에 **Apache NiFi 2.11.0**과 **[nifipilot-plus](https://github.c
 - Security Group에서 **SSH(22)만** 열면 됩니다. 8443/8000은 열지 마세요. MCP 엔드포인트에는 인증이 없습니다.
 - Red Hat 계열이면 `nm-cloud-setup` 비활성화, firewalld, SELinux(`k3s-selinux`) 확인이 필요합니다. 아래 문제 해결 참고.
 
-**작업 PC**: Docker(buildx 포함), `ssh`/`scp`, [nifipilot-plus](https://github.com/edb-korea/nifipilot-plus) 체크아웃(이 repo와 같은 상위 폴더).
+**VM에서 이미지를 빌드하려면 (방법 A, 권장)**: `git`과 Docker 또는 Podman이 필요합니다. k3s 자체에는 이미지 빌더가 없습니다.
+
+```bash
+# Amazon Linux 2023
+sudo dnf install -y git docker && sudo systemctl enable --now docker && sudo usermod -aG docker $USER   # 다시 로그인
+# RHEL / Rocky
+sudo dnf install -y git podman
+# Ubuntu / Debian
+sudo apt-get install -y git podman        # 또는 docker.io
+```
+
+**작업 PC에서 이미지를 빌드하려면 (방법 B)**: Docker(buildx 포함), `ssh`/`scp`, [nifipilot-plus](https://github.com/edb-korea/nifipilot-plus) 체크아웃(이 repo와 같은 상위 폴더).
 
 ```bash
 git clone https://github.com/edb-korea/nifipilot-plus ../nifipilot-plus   # 이 repo 옆에 둡니다
@@ -43,46 +55,61 @@ ssh <user>@<vm-ip> uname -m      # x86_64 = amd64, aarch64 = arm64
 
 ## 배포 순서
 
-### 1. 사이드카 이미지 빌드 (작업 PC)
+### 방법 A (권장): VM에서 빌드와 배포를 한 번에
+
+VM이 소스(GitHub의 nifipilot-plus)를 직접 받아 **VM의 CPU 아키텍처에 맞게** 빌드하므로, 아키텍처를 신경 쓸 필요도 이미지를 옮길 필요도 없습니다.
+
+```bash
+# 작업 PC: 이 repo를 VM으로 복사 (이 repo는 비공개라서 VM에서 git clone이 안 됩니다)
+rsync -av --exclude dist --exclude .git ./ <user>@<vm-ip>:~/nifi-mcp-k3s-deploy/
+
+# VM
+ssh <user>@<vm-ip>
+cd ~/nifi-mcp-k3s-deploy
+./scripts/bootstrap-on-vm.sh
+```
+
+`bootstrap-on-vm.sh`는 세 단계를 순서대로 실행합니다.
+1. `build-on-vm.sh`: nifipilot-plus를 clone하고 이미지를 빌드해 k3s containerd에 임포트
+2. `deploy.sh`: 비밀번호를 물어보고(**12자 이상**, 화면에 표시되지 않음) 네임스페이스와 Secret을 만든 뒤 매니페스트를 적용
+3. `verify.sh`: 컨테이너 상태와 MCP 호출 확인
+
+**NiFi 이미지(약 1GB)를 받고 첫 기동하는 데 수 분이 걸립니다.** 단계를 따로 실행해도 됩니다(`KUBECTL="sudo k3s kubectl"`을 붙여서).
+
+| 환경변수 | 기본값 | 설명 |
+|---|---|---|
+| `NIFIPILOT_REF` | `main` | 빌드할 브랜치, 태그, 커밋. 재현성이 필요하면 커밋 SHA로 고정 |
+| `NIFIPILOT_REPO` | `https://github.com/edb-korea/nifipilot-plus` | 소스 주소 |
+| `BUILDER` | 설치된 것(docker 우선) | `docker` 또는 `podman` |
+| `MCP_IMAGE` | `nifipilot-plus:0.1.0` | 이미지 이름과 태그 |
+| `NIFI_PASSWORD` | (질문) | 비밀번호를 환경변수로 줄 때 |
+
+**소스를 바꿔 다시 빌드할 때**: `./scripts/build-on-vm.sh` 후 `sudo k3s kubectl -n nifi rollout restart deploy/nifi`. 같은 태그를 쓰므로 Pod를 다시 만들어야 새 이미지가 적용됩니다(NiFi도 함께 재시작됩니다).
+
+### 방법 B: 작업 PC에서 빌드해 VM으로 전달
+
+VM에 Docker/Podman을 설치하고 싶지 않을 때 쓰는 대안입니다.
 
 ```bash
 ./scripts/build-image.sh                        # 기본 linux/amd64
 PLATFORM=linux/arm64 ./scripts/build-image.sh   # Graviton(arm64) VM이면
-```
-
-`dist/nifipilot-plus_0.1.0-<arch>.tar`가 만들어집니다. Apple Silicon에서 amd64를 빌드하면 에뮬레이션이라 느립니다.
-
-### 2. 이미지와 파일을 VM으로 전달 (작업 PC)
-
-```bash
 ./scripts/push-image.sh <user>@<vm-ip>                                   # VM 아키텍처에 맞는 tar를 자동 선택
 SSH_OPTS="-i ~/.ssh/my-key.pem" ./scripts/push-image.sh <user>@<vm-ip>   # 키 파일을 쓰는 경우
 rsync -av --exclude dist --exclude .git ./ <user>@<vm-ip>:~/nifi-mcp-k3s-deploy/
-```
 
-이미지는 레지스트리 없이 k3s의 containerd에 직접 임포트합니다(매니페스트는 `imagePullPolicy: IfNotPresent`).
-
-### 3. 배포 (VM)
-
-```bash
 ssh <user>@<vm-ip>
 cd ~/nifi-mcp-k3s-deploy
 KUBECTL="sudo k3s kubectl" ./scripts/deploy.sh
-```
-
-비밀번호를 물어봅니다(**12자 이상**, 화면에 표시되지 않음). `NIFI_PASSWORD` 환경변수로 줄 수도 있습니다.
-네임스페이스 `nifi`와 Secret을 만들고 매니페스트를 적용한 뒤 NiFi가 준비될 때까지 기다립니다.
-**NiFi 이미지(약 1GB)를 받고 첫 기동하는 데 수 분이 걸립니다.**
-
-### 4. 검증 (VM)
-
-```bash
 KUBECTL="sudo k3s kubectl" ./scripts/verify.sh
 ```
 
-컨테이너 2개가 `ready`이고, `tools: 29  mode: readonly`와 `NiFi 2.11.0`이 출력되면 정상입니다.
+Apple Silicon에서 amd64를 빌드하면 에뮬레이션이라 느립니다. 이미지는 레지스트리 없이 k3s의 containerd에 직접 임포트합니다(매니페스트는 `imagePullPolicy: IfNotPresent`).
 
-### 5. 접속
+### 정상 확인
+
+`verify.sh`에서 컨테이너 2개가 `ready`이고 `tools: 29  mode: readonly`와 `NiFi 2.11.0`이 출력되면 정상입니다.
+
+### 접속
 
 NiFi UI와 MCP 엔드포인트는 클러스터 안에서만 열려 있습니다. VM에서 port-forward하고, 작업 PC에서 SSH 터널로 가져옵니다.
 
@@ -143,8 +170,11 @@ $K rollout restart deploy/nifi                # 재시작 (비밀번호 변경 �
 
 | 증상 | 원인과 조치 |
 |---|---|
-| `mcp` 컨테이너 `ErrImagePull` / `ImagePullBackOff` | 이미지가 containerd에 없음. `push-image.sh`를 다시 실행하고 `sudo k3s ctr images ls \| grep nifipilot-plus`로 확인 |
-| `exec format error` | VM과 이미지 아키텍처가 다름. `uname -m`을 확인하고 `PLATFORM`을 맞춰 다시 빌드·전달 |
+| `mcp` 컨테이너 `ErrImagePull` / `ImagePullBackOff` | 이미지가 containerd에 없음. `build-on-vm.sh`(또는 `push-image.sh`)를 다시 실행하고 `sudo k3s ctr images ls \| grep nifipilot-plus`로 확인 |
+| `exec format error` | VM과 이미지 아키텍처가 다름(방법 B). `uname -m`을 확인하고 `PLATFORM`을 맞춰 다시 빌드·전달하거나, VM에서 빌드하는 방법 A를 쓰세요 |
+| `build-on-vm.sh`: `permission denied ... docker.sock` | 현재 사용자가 docker 그룹이 아님. `sudo usermod -aG docker $USER` 후 다시 로그인하거나 `sudo ./scripts/build-on-vm.sh` |
+| `build-on-vm.sh`: git clone 실패 | VM에서 github.com으로 나가는 통신(443)이 막혀 있는지, `git`이 설치됐는지 확인 |
+| 빌드 중 메모리 부족/느림 | 빌드는 NiFi를 올리기 전에 하세요(첫 설치). 이미 NiFi가 도는 VM이면 메모리 여유를 확인 |
 | `CreateContainerConfigError` | `kubectl describe pod`의 Events 확인. Secret `nifi-credentials`가 없으면 `deploy.sh`를 실행하지 않은 것 |
 | `nifi` 컨테이너가 `OOMKilled`로 반복 재시작 | VM 메모리 부족. 8GB 이상으로 올리거나 매니페스트의 `NIFI_JVM_HEAP_MAX`와 메모리 한도를 낮춤 |
 | 브라우저에서 `Invalid host header` / 400 | `localhost:8443` 이외의 주소로 접속함. 다른 주소를 쓰려면 `NIFI_WEB_PROXY_HOST`에 `host:port`를 추가 |
@@ -164,8 +194,10 @@ $K rollout restart deploy/nifi                # 재시작 (비밀번호 변경 �
 | 경로 | 역할 |
 |---|---|
 | `manifests/nifi-with-mcp.yaml` | Namespace, PVC, Deployment(NiFi + MCP 사이드카), Service 2개 |
-| `scripts/build-image.sh` | 사이드카 이미지를 빌드해 `dist/*.tar`로 저장 |
-| `scripts/push-image.sh` | VM으로 복사하고 k3s containerd에 임포트 |
+| `scripts/bootstrap-on-vm.sh` | **VM에서** 빌드 + 배포 + 검증을 한 번에 (방법 A) |
+| `scripts/build-on-vm.sh` | **VM에서** nifipilot-plus를 clone·빌드(Docker/Podman)하고 k3s containerd에 임포트 |
+| `scripts/build-image.sh` | 작업 PC에서 사이드카 이미지를 빌드해 `dist/*.tar`로 저장 (방법 B) |
+| `scripts/push-image.sh` | 작업 PC에서 VM으로 복사하고 k3s containerd에 임포트 (방법 B) |
 | `scripts/deploy.sh` | 네임스페이스와 Secret 생성, 매니페스트 적용, 기동 대기 |
 | `scripts/verify.sh` | 컨테이너 상태 확인과 사이드카 안에서 MCP 호출 |
 | `scripts/uninstall.sh` | 삭제 (`--purge`는 데이터까지) |

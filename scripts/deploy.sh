@@ -25,11 +25,12 @@ if [ "${#NIFI_PASSWORD}" -lt 12 ]; then
   exit 1
 fi
 
-# The image must already exist in k3s' containerd (scripts/push-image.sh), otherwise the
-# sidecar ends up in ErrImagePull. Skipped when k3s is not local.
-if command -v k3s >/dev/null 2>&1; then
-  if ! sudo k3s ctr images ls -q 2>/dev/null | grep -q "${MCP_IMAGE}"; then
-    echo "WARNING: image ${MCP_IMAGE} is not imported into k3s yet (run scripts/push-image.sh)." >&2
+# The image must already exist in k3s' containerd (scripts/build-on-vm.sh or push-image.sh),
+# otherwise the sidecar ends up in ErrImagePull. Skipped when k3s is not local.
+K3S_CTR="${K3S_CTR:-sudo k3s ctr}"
+if [ -n "${K3S_CTR_CHECK:-}" ] || command -v k3s >/dev/null 2>&1; then
+  if ! ${K3S_CTR} images ls -q 2>/dev/null | grep -q "${MCP_IMAGE}"; then
+    echo "WARNING: image ${MCP_IMAGE} is not imported into k3s yet (run scripts/build-on-vm.sh)." >&2
   fi
 fi
 
