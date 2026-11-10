@@ -1,0 +1,170 @@
+# NiFi + nifipilot-plus MCP sidecar in one Pod.
+#
+# Both containers share the Pod's network namespace, so the sidecar reaches NiFi at
+# https://localhost:8443. The MCP endpoint has no authentication: it only gets a ClusterIP
+# Service and is reached with `kubectl port-forward` (see README.md).
+#
+# Apply it with scripts/deploy.sh (it also creates the credentials Secret, which is NOT in
+# this file on purpose).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nifi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nifi-data
+  namespace: nifi
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nifi
+  namespace: nifi
+spec:
+  replicas: 1 # single node; do not scale (NiFi clustering needs ZooKeeper/Kubernetes state)
+  strategy:
+    type: Recreate # the RWO volume cannot be mounted by two Pods
+  selector:
+    matchLabels:
+      app: nifi
+  template:
+    metadata:
+      labels:
+        app: nifi
+    spec:
+      securityContext:
+        fsGroup: 1000 # NiFi runs as uid 1000
+      containers:
+        - name: nifi
+          image: apache/nifi:2.11.0
+          ports:
+            - name: https
+              containerPort: 8443
+          env:
+            - name: SINGLE_USER_CREDENTIALS_USERNAME
+              valueFrom:
+                secretKeyRef: {name: nifi-credentials, key: username}
+            - name: SINGLE_USER_CREDENTIALS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: nifi-credentials, key: password}
+            # Listen on all interfaces so the sidecar (and the Service) can connect
+            - name: NIFI_WEB_HTTPS_HOST
+              value: "0.0.0.0"
+            # NiFi rejects requests whose Host header is not listed here: add every
+            # host:port you use (port-forward, Ingress host name, NodePort ...)
+            - name: NIFI_WEB_PROXY_HOST
+              value: "localhost:8443,nifi:8443,nifi.nifi.svc:8443,nifi.nifi.svc.cluster.local:8443"
+            - name: NIFI_JVM_HEAP_INIT
+              value: "1g"
+            - name: NIFI_JVM_HEAP_MAX
+              value: "2g"
+          resources:
+            requests: {cpu: "500m", memory: "2Gi"}
+            limits: {memory: "4Gi"}
+          # exec probes: an HTTP probe would send the Pod IP as Host header, which NiFi rejects (400)
+          startupProbe:
+            exec: &probe
+              command:
+                - sh
+                - -c
+                - "curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/nifi-api/access/config | grep -qE '^(200|401)$'"
+            periodSeconds: 10
+            failureThreshold: 60 # up to 10 minutes for the first start
+            timeoutSeconds: 10
+          readinessProbe:
+            exec: *probe
+            periodSeconds: 20
+            timeoutSeconds: 10
+          livenessProbe:
+            exec: *probe
+            periodSeconds: 30
+            failureThreshold: 6
+            timeoutSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /opt/nifi/nifi-current/database_repository, subPath: database_repository}
+            - {name: data, mountPath: /opt/nifi/nifi-current/flowfile_repository, subPath: flowfile_repository}
+            - {name: data, mountPath: /opt/nifi/nifi-current/content_repository, subPath: content_repository}
+            - {name: data, mountPath: /opt/nifi/nifi-current/provenance_repository, subPath: provenance_repository}
+            - {name: data, mountPath: /opt/nifi/nifi-current/state, subPath: state}
+
+        # ---- sidecar: MCP server ------------------------------------------------------------
+        - name: mcp
+          image: nifipilot-plus:0.1.0 # imported into k3s by scripts/push-image.sh (not pulled)
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mcp
+              containerPort: 8000
+          env:
+            - name: NIFI_URL
+              value: "https://localhost:8443"
+            - name: NIFI_USERNAME
+              valueFrom:
+                secretKeyRef: {name: nifi-credentials, key: username}
+            - name: NIFI_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: nifi-credentials, key: password}
+            - name: NIFI_VERIFY_SSL
+              value: "false" # NiFi's generated certificate is self-signed
+            - name: MCP_MODE
+              value: "readonly" # "full" enables the 37 write/control tools
+            - name: MCP_TOOLSETS
+              value: "all"
+            - name: MCP_DRY_RUN
+              value: "false"
+            - name: MCP_AUDIT_LOG_PATH
+              value: "/tmp/audit.log" # root filesystem is read-only; /tmp is an emptyDir
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001 # the image's `mcp` user; kubelet cannot verify a non-numeric USER
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: "50m", memory: "128Mi"}
+            limits: {memory: "256Mi"}
+          readinessProbe:
+            tcpSocket: {port: 8000}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nifi-data
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi
+  namespace: nifi
+spec:
+  selector:
+    app: nifi
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+---
+# Internal only: the MCP endpoint is unauthenticated. Reach it with `kubectl port-forward`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi-mcp
+  namespace: nifi
+spec:
+  type: ClusterIP
+  selector:
+    app: nifi
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
