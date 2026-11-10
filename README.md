@@ -60,14 +60,15 @@ ssh <user>@<vm-ip> uname -m      # x86_64 = amd64, aarch64 = arm64
 VM이 소스(GitHub의 nifipilot-plus)를 직접 받아 **VM의 CPU 아키텍처에 맞게** 빌드하므로, 아키텍처를 신경 쓸 필요도 이미지를 옮길 필요도 없습니다.
 
 ```bash
-# 작업 PC: 이 repo를 VM으로 복사 (이 repo는 비공개라서 VM에서 git clone이 안 됩니다)
-rsync -av --exclude dist --exclude .git ./ <user>@<vm-ip>:~/nifi-mcp-k3s-deploy/
-
 # VM
 ssh <user>@<vm-ip>
-cd ~/nifi-mcp-k3s-deploy
+git clone https://github.com/edb-korea/nifi-mcp-k3s-deploy
+cd nifi-mcp-k3s-deploy
 ./scripts/bootstrap-on-vm.sh
 ```
+
+VM에서 github.com에 접속할 수 없으면 작업 PC에서 복사합니다:
+`rsync -av --exclude dist --exclude .git ./ <user>@<vm-ip>:~/nifi-mcp-k3s-deploy/`
 
 `bootstrap-on-vm.sh`는 세 단계를 순서대로 실행합니다.
 1. `build-on-vm.sh`: nifipilot-plus를 clone하고 이미지를 빌드해 k3s containerd에 임포트
